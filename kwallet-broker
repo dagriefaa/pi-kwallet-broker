@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+# kwallet-broker — use KWallet credentials from the shell without exposing them.
+#
+# Secrets are read from KWallet inside the tool and fed to curl via a mode-0600
+# curl config file (-K), so they never appear on the command line, in `ps`, or
+# in shell history. `set` writes via kwallet-query -w stdin so the value never
+# hits the command line either.
+#
+# FOLDER IS LOCKED to "pi-agent". This tool can ONLY ever access the pi-agent
+# folder. There is no --folder flag and KWALLET_FOLDER is intentionally not
+# honored, so the tool cannot be pointed at any other folder in the wallet.
+#
+# Config (env vars):
+#   KWALLET_NAME     Wallet name  (default: kdewallet)
+#
+# See: kwallet-broker --help  and  kwallet-broker <command> --help
+
+set -euo pipefail
+
+PROG="${0##*/}"
+WALLET="${KWALLET_NAME:-kdewallet}"
+FOLDER="pi-agent"   # hardcoded — never overridable
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+# --- helpers --------------------------------------------------------------
+
+# Read a secret from the LOCKED pi-agent folder. NEVER print secrets unless the
+# user explicitly asks (kwallet-broker get).
+read_secret() {
+  local entry="$1"
+  need kwallet-query
+  kwallet-query -r "$entry" -f "$FOLDER" "$WALLET" 2>/dev/null \
+    | sed 's/\r$//' | awk 'BEGIN{ORS=""} {print} END{print ""}'
+}
+
+list_entries() {
+  kwallet-query -l -f "$FOLDER" "$WALLET" 2>/dev/null || true
+}
+
+folder_exists() {
+  # Reliable check via qdbus hasFolder (kwallet-query -l exit code is unreliable).
+  db_has_folder "$FOLDER"
+}
+
+# --- qdbus (D-Bus) helpers ------------------------------------------------
+
+_qbin() {
+  for c in qdbus6 qdbus-qt6 qdbus; do command -v "$c" >/dev/null 2>&1 && { echo "$c"; return; }; done
+  return 1
+}
+
+db_resolve() {
+  # sets globals DB_SVC, DB_PATH. dies on failure.
+  local qbin
+  qbin="$(_qbin)" || die "no qdbus binary found (tried qdbus6, qdbus-qt6, qdbus)"
+  for svc in org.kde.kwalletd6 org.kde.kwalletd5; do
+    if "$qbin" "$svc" >/dev/null 2>&1; then
+      case "$svc" in
+        org.kde.kwalletd6) DB_PATH="/modules/kwalletd6" ;; *) DB_PATH="/modules/kwalletd5" ;;
+      esac
+      DB_SVC="$svc"; DB_QBIN="$qbin"; return 0
+    fi
+  done
+  die "KWallet D-Bus service not reachable (is KWallet running?)"
+}
+
+db_open() {
+  # prints a valid wallet handle (>=0)
+  db_resolve
+  local handle
+  handle="$("$DB_QBIN" "$DB_SVC" "$DB_PATH" org.kde.KWallet.open "$WALLET" 0 "$PROG" 2>/dev/null || true)"
+  [[ "$handle" =~ ^[0-9]+$ ]] || die "KWallet.open('$WALLET') failed (handle='$handle'); unlock the wallet"
+  [ "$handle" -ge 0 ] || die "KWallet.open('$WALLET') returned handle $handle"
+  echo "$handle"
+}
+
+db_has_folder() {
+  local folder="$1"
+  db_resolve
+  local handle
+  handle="$(db_open)"
+  "$DB_QBIN" "$DB_SVC" "$DB_PATH" org.kde.KWallet.hasFolder "$handle" "$folder" "$PROG" 2>/dev/null \
+    | grep -qi 'true\|1'
+}
+
+db_entry_list() {
+  db_resolve
+  local handle
+  handle="$(db_open)"
+  "$DB_QBIN" "$DB_SVC" "$DB_PATH" org.kde.KWallet.entryList "$handle" "$FOLDER" "$PROG" 2>/dev/null
+}
+
+db_write_password() {
+  # $1=entry $2=value. Value MUST already be safe to put on cmdline; only used
+  # with an empty value here (entry creation). Real secrets go via kwallet-query -w stdin.
+  local entry="$1" value="$2"
+  db_resolve
+  local handle
+  handle="$(db_open)"
+  "$DB_QBIN" "$DB_SVC" "$DB_PATH" org.kde.KWallet.writePassword "$handle" "$FOLDER" "$entry" "$value" "$PROG" 2>/dev/null
+}
+
+db_remove_entry() {
+  local entry="$1"
+  db_resolve
+  local handle
+  handle="$(db_open)"
+  "$DB_QBIN" "$DB_SVC" "$DB_PATH" org.kde.KWallet.removeEntry "$handle" "$FOLDER" "$entry" "$PROG" 2>/dev/null \
+    | grep -qi 'true\|1\|0' || die "removeEntry('$entry') returned false"
+}
+
+# Create the LOCKED pi-agent folder via KWallet D-Bus (qdbus6 / qdbus). Idempotent.
+ensure_folder() {
+  db_resolve
+  local handle
+  handle="$(db_open)"
+  if "$DB_QBIN" "$DB_SVC" "$DB_PATH" org.kde.KWallet.hasFolder "$handle" "$FOLDER" "$PROG" 2>/dev/null | grep -qi 'true\|1'; then
+    return 0
+  fi
+  "$DB_QBIN" "$DB_SVC" "$DB_PATH" org.kde.KWallet.createFolder "$handle" "$FOLDER" "$PROG" 2>/dev/null \
+    | grep -qi 'true\|1' || die "createFolder('$FOLDER') returned false; wallet may be read-only"
+  # Flush: KWallet6 keeps folder creation in-memory until the wallet handle is
+  # closed. Without this the folder vanishes on the next open / kwalletd idle close.
+  "$DB_QBIN" "$DB_SVC" "$DB_PATH" org.kde.KWallet.close "$handle" "$PROG" >/dev/null 2>&1 || true
+}
+
+# Secure temp curl config file (mode 600) holding the secret-bearing header/url.
+mkcfg() {
+  umask 077
+  mktemp "${TMPDIR:-/tmp}/kwallet-broker.XXXXXX.cfg"
+}
+
+# --- subcommands ----------------------------------------------------------
+
+cmd_api() {
+  local entry="" url="" method="GET" mode="bearer" auth_header="" auth_query="" basic_user=""
+  local -a extra_headers=() data=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --entry) entry="$2"; shift 2 ;;
+      --url) url="$2"; shift 2 ;;
+      --method) method="$2"; shift 2 ;;
+      --mode) mode="$2"; shift 2 ;;
+      --header-name) auth_header="$2"; shift 2 ;;
+      --query-name) auth_query="$2"; shift 2 ;;
+      --user) basic_user="$2"; shift 2 ;;
+      -H|--header) extra_headers+=("$2"); shift 2 ;;
+      -d|--data) data+=("--data-binary" "$2"); shift 2 ;;
+      --max-time) extra_headers+=("--max-time" "$2"); shift 2 ;;
+      --folder) die "api: --folder is not supported; folder is locked to '$FOLDER'" ;;
+      -h|--help) cat <<EOF
+usage: $PROG api --entry <name> --url <url> [options]
+Make an HTTPS/HTTP request authenticated by a KWallet secret from the LOCKED
+'$FOLDER' folder. The secret is read from KWallet and passed to curl via a
+mode-0600 config file, so it never appears on the command line or in 'ps'.
+
+required:
+  --entry <name>        KWallet entry holding the secret (in folder '$FOLDER')
+  --url <url>           Full URL (scheme + host + path)
+
+options:
+  --method <M>          HTTP method (default GET)
+  --mode <m>            How to attach the secret (default bearer):
+                          bearer          Authorization: Bearer <secret>
+                          basic           Authorization: Basic base64(user:secret)  (set --user)
+                          header          put secret in header named --header-name
+                          apikey-query    put secret in query param --query-name
+                          none            don't attach
+  --header-name <H>     header name for --mode header
+  --query-name <Q>      query param name for --mode apikey-query
+  --user <user>         username for --mode basic
+  -H, --header "K: V"   extra request header (repeatable; must NOT contain the secret)
+  -d, --data <body>     request body (repeatable)
+  --max-time <s>        curl max-time
+  -h, --help            show this help
+
+env:
+  KWALLET_NAME    wallet name  (default kdewallet)
+  (folder is fixed to '$FOLDER' and cannot be changed)
+
+examples:
+  $PROG api --entry agent-openai --url https://api.openai.com/v1/models
+  $PROG api --entry gh --mode header --header-name Authorization --url https://api.github.com/user
+  $PROG api --entry svc --mode basic --user alice --url https://api.example.com/v1/ping
+EOF
+        return 0 ;;
+      *) die "api: unknown option '$1' (see: $PROG api --help)" ;;
+    esac
+  done
+  [ -n "$entry" ] || die "api: --entry is required (see: $PROG api --help)"
+  [ -n "$url" ]   || die "api: --url is required (see: $PROG api --help)"
+  need curl; need kwallet-query
+
+  local secret
+  secret="$(read_secret "$entry")" || die "api: failed to read KWallet entry '$entry' (folder '$FOLDER', wallet '$WALLET')"
+
+  local cfg
+  cfg="$(mkcfg)"
+  trap 'rm -f "$cfg"' EXIT
+  {
+    printf 'silent\nshow-error\nlocation\n'
+    case "$mode" in
+      bearer) printf 'header = "Authorization: Bearer %s"\n' "$secret" ;;
+      basic)
+        [ -n "$basic_user" ] || die "api: --mode basic requires --user"
+        printf 'header = "Authorization: Basic %s"\n' "$(printf '%s:%s' "$basic_user" "$secret" | base64 -w0)"
+        ;;
+      header)
+        [ -n "$auth_header" ] || die "api: --mode header requires --header-name"
+        printf 'header = "%s: %s"\n' "$auth_header" "$secret"
+        ;;
+      apikey-query)
+        [ -n "$auth_query" ] || die "api: --mode apikey-query requires --query-name"
+        local sep="?"
+        [[ "$url" == *\?* ]] && sep="&"
+        printf 'url = "%s%s%s=%s"\n' "$url" "$sep" "$auth_query" "$secret"
+        ;;
+      none) ;;
+      *) die "api: unknown --mode '$mode'" ;;
+    esac
+    local h
+    for h in "${extra_headers[@]:-}"; do
+      [ -n "$h" ] && printf 'header = "%s"\n' "$h"
+    done
+  } > "$cfg"
+
+  if [ "$mode" = "apikey-query" ]; then
+    curl -K "$cfg" -X "$method" "${data[@]}" 2>&1
+  else
+    curl -K "$cfg" -X "$method" "$url" "${data[@]}" 2>&1
+  fi
+  local rc=$?
+  rm -f "$cfg"; trap - EXIT
+  exit $rc
+}
+
+cmd_list() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --folder) die "list: --folder is not supported; folder is locked to '$FOLDER'" ;;
+      -h|--help)
+        cat <<EOF
+usage: $PROG list
+List KWallet entry NAMES in the LOCKED '$FOLDER' folder (never values).
+There is no --folder option: this tool can only ever access '$FOLDER'.
+options:
+  -h, --help    show this help
+env:
+  KWALLET_NAME    wallet name  (default kdewallet)
+EOF
+        return 0 ;;
+      *) die "list: unknown option '$1'" ;;
+    esac
+  done
+  need kwallet-query
+  if ! folder_exists; then
+    printf '%s: folder "%s" not found in wallet "%s"\n' "$PROG" "$FOLDER" "$WALLET" >&2
+    printf 'create it with: %s ensure-folder\n' "$PROG" >&2
+    exit 1
+  fi
+  list_entries
+}
+
+cmd_set() {
+  local entry="" from_stdin=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stdin) from_stdin=1; shift ;;
+      --folder) die "set: --folder is not supported; folder is locked to '$FOLDER'" ;;
+      -h|--help)
+        cat <<EOF
+usage: $PROG set <entry> [--stdin]
+Store a secret in the LOCKED '$FOLDER' folder. The value never appears on the
+command line, in 'ps', or in shell history.
+
+  <entry>        KWallet entry name to create/overwrite (in folder '$FOLDER')
+  --stdin        read the secret from stdin (pipe). If omitted and stdin is a
+                 TTY, prompts interactively with echo OFF (hidden input).
+                 If omitted and stdin is a pipe, reads the pipe.
+  -h, --help     show this help
+
+There is no --folder option: this tool can only ever write to '$FOLDER'.
+
+examples:
+  printf '%s' "\$API_KEY" | $PROG set agent-openai
+  $PROG set agent-openai        # interactive: prompts 'Secret for agent-openai: '
+  secret-tool lookup ... | $PROG set migrated
+EOF
+        return 0 ;;
+      *) entry="$1"; shift ;;
+    esac
+  done
+  [ -n "$entry" ] || die "set: <entry> is required (see: $PROG set --help)"
+  if ! folder_exists; then
+    printf '%s: WARNING: folder "%s" not found in wallet "%s"\n' "$PROG" "$FOLDER" "$WALLET" >&2
+    printf '%s: create it first with: %s ensure-folder\n' "$PROG" "$PROG" >&2
+    exit 1
+  fi
+  need kwallet-query
+  # Capture the secret into a shell var (process memory only). Three input modes:
+  #   --stdin              -> read stdin (pipe)
+  #   no --stdin, TTY      -> interactive prompt, echo OFF (read -rs)
+  #   no --stdin, piped    -> read stdin (pipe)
+  local value
+  if [ "$from_stdin" -eq 1 ] || [ ! -t 0 ]; then
+    value="$(cat)"
+  else
+    read -rs -p "Secret for '$entry' (hidden, no echo): " value </dev/tty >/dev/tty 2>&1 || die "set: failed to read prompt"
+    printf '\n' >&2
+  fi
+  # Two-step write: kwallet-query -w silently fails to CREATE new entries in
+  # KWallet6 (it only overwrites). Create empty via qdbus (empty is not a
+  # secret, safe on cmdline), then overwrite the real value via kwallet-query -w
+  # stdin so the secret never hits the command line / ps / history.
+  if ! db_entry_list | grep -qxF "$entry"; then
+    db_write_password "$entry" '' >/dev/null || die "set: qdbus create-empty failed for '$entry'"
+  fi
+  printf '%s' "$value" | kwallet-query -w "$entry" -f "$FOLDER" "$WALLET" >/dev/null
+  # verify the overwrite actually persisted
+  local back
+  back="$(read_secret "$entry")" || die "set: verify read failed for '$entry'"
+  if [ "$back" != "$value" ]; then
+    die "set: verify failed for '$entry' — read-back mismatch (entry may be empty); retry"
+  fi
+}
+
+cmd_get() {
+  local entry=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --folder) die "get: --folder is not supported; folder is locked to '$FOLDER'" ;;
+      -h|--help)
+        cat <<EOF
+usage: $PROG get <entry>
+Print a KWallet secret from the LOCKED '$FOLDER' folder to stdout.
+OPERATOR ONLY — do not pipe into the agent.
+  <entry>        KWallet entry name (in folder '$FOLDER')
+  -h, --help     show this help
+There is no --folder option: this tool can only ever read from '$FOLDER'.
+EOF
+        return 0 ;;
+      *) entry="$1"; shift ;;
+    esac
+  done
+  [ -n "$entry" ] || die "get: <entry> is required (see: $PROG get --help)"
+  need kwallet-query
+  read_secret "$entry"
+}
+
+cmd_delete() {
+  local entry=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --folder) die "delete: --folder is not supported; folder is locked to '$FOLDER'" ;;
+      -h|--help)
+        cat <<EOF
+usage: $PROG delete <entry>
+Clear a KWallet entry in the LOCKED '$FOLDER' folder by overwriting it with
+empty (kwallet-query has no delete flag; full removal needs qdbus
+org.kde.KWallet.removeEntry).
+  <entry>        KWallet entry name (in folder '$FOLDER')
+  -h, --help     show this help
+There is no --folder option: this tool can only ever modify '$FOLDER'.
+EOF
+        return 0 ;;
+      *) entry="$1"; shift ;;
+    esac
+  done
+  [ -n "$entry" ] || die "delete: <entry> is required (see: $PROG delete --help)"
+  if ! folder_exists; then
+    printf '%s: WARNING: folder "%s" not found in wallet "%s"\n' "$PROG" "$FOLDER" "$WALLET" >&2
+    exit 1
+  fi
+  db_remove_entry "$entry"
+}
+
+cmd_ensure_folder() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        cat <<EOF
+usage: $PROG ensure-folder
+Create the LOCKED '$FOLDER' folder if it does not exist (idempotent). Uses
+qdbus6/qdbus. There is no folder argument: this tool only manages '$FOLDER'.
+options:
+  -h, --help    show this help
+env:
+  KWALLET_NAME    wallet name  (default kdewallet)
+EOF
+        return 0 ;;
+      *) die "ensure-folder: no arguments accepted (folder is locked to '$FOLDER')" ;;
+    esac
+  done
+  ensure_folder
+  printf 'folder "%s" ready in wallet "%s"\n' "$FOLDER" "$WALLET"
+}
+
+cmd_help() {
+  cat <<EOF
+$PROG — use KWallet credentials from the shell without exposing them.
+
+Secrets are read from KWallet inside the tool and passed to curl via a
+mode-0600 curl config file (-K), so they never appear on the command line,
+in 'ps', or in shell history. Storing a secret writes via kwallet-query -w
+stdin for the same reason.
+
+FOLDER IS LOCKED to "$FOLDER". This tool can ONLY ever access the "$FOLDER"
+folder. There is no --folder flag and KWALLET_FOLDER is not honored, so it
+cannot be pointed at any other folder in the wallet.
+
+usage: $PROG <command> [options]
+       $PROG <command> --help
+       $PROG --help | -h
+
+commands:
+  api             make an HTTPS/HTTP call authenticated by a KWallet entry
+  list            list KWallet entry NAMES in "$FOLDER" (never values)
+  set             store a secret in "$FOLDER" (reads value from stdin via --stdin)
+  get             print a secret from "$FOLDER" to stdout (operator only)
+  delete          clear an entry in "$FOLDER" (overwrite with empty)
+  ensure-folder   create the "$FOLDER" folder if missing (uses qdbus)
+  help            show this help
+
+config (env vars):
+  KWALLET_NAME    wallet name  (default: kdewallet)
+  (folder is fixed to "$FOLDER" and cannot be changed)
+
+quick start:
+  $PROG ensure-folder
+  printf '%s' "\$API_KEY" | $PROG set agent-openai --stdin
+  $PROG api --entry agent-openai --url https://api.openai.com/v1/models
+  $PROG list
+
+location: $(readlink -f "$0" 2>/dev/null || echo "$0")
+EOF
+}
+
+# --- dispatch -------------------------------------------------------------
+
+main() {
+  [ $# -gt 0 ] || { cmd_help; exit 1; }
+  case "$1" in
+    -h|--help|help) cmd_help; exit 0 ;;
+    api)            shift; cmd_api "$@" ;;
+    list)           shift; cmd_list "$@" ;;
+    set)            shift; cmd_set "$@" ;;
+    get)            shift; cmd_get "$@" ;;
+    delete)         shift; cmd_delete "$@" ;;
+    ensure-folder)  shift; cmd_ensure_folder "$@" ;;
+    version|--version) printf '%s\n' "$PROG 1.1.0"; exit 0 ;;
+    *) die "unknown command '$1' (see: $PROG --help)" ;;
+  esac
+}
+
+main "$@"
