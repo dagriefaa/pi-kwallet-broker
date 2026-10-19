@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "lib": ["es2022", "dom"],
+    "baseUrl": ".",
+    "paths": {
+      "@earendil-works/pi-coding-agent": ["/home/raymondkiss/.local/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"],
+      "typebox": ["/home/raymondkiss/.local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/typebox/build/index.d.mts"]
+    }
+  },
+  "include": ["index.ts"]
+}
