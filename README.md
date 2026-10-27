@@ -1,6 +1,7 @@
 # kwallet-broker
 
-A small shell CLI that lets you **use** credentials stored in [KWallet](https://docs.kde.org/stable5/en/kwalletmanager/kwalletmanager/index.html) from the command line **without exposing their values** — secrets are read from KWallet inside the tool and fed to `curl` via a mode-`0600` curl config file (`-K`), so they never appear on the command line, in `ps`, or in shell history.
+
+[pi](https://pi.dev) extension + cli util to embed secrets in commands and api calls witrhout exposing the same to the agent.
 
 ## Requirements
 
@@ -12,10 +13,7 @@ A small shell CLI that lets you **use** credentials stored in [KWallet](https://
 
 ```bash
 chmod +x kwallet-broker
-# option A: link into ~/.local/bin (assumes it's on PATH)
 ln -sf "$PWD/kwallet-broker" ~/.local/bin/kwallet-broker
-# option B: copy to /usr/local/bin
-sudo install -m755 kwallet-broker /usr/local/bin/kwallet-broker
 ```
 
 ## Quick start
@@ -84,7 +82,3 @@ Override the wallet per-invocation: `KWALLET_NAME=other-wallet kwallet-broker li
 - `get` prints the secret to stdout — **operator only**. Don't pipe it into an AI agent.
 - `run` executes the command via `bash -c` in a subshell with the secret exported as an environment variable (`KWALLET_SECRET` by default, or `--env NAME`). The secret never appears on any process's argv — `bash -c`'s argv contains only the placeholder command, and bash expands the variable internally. The command string should be single-quoted so your own shell doesn't expand the placeholder. The child process's *environment* does contain the secret (same-user/root readable via `/proc`), as does anything the command spawns — like `get`, this is an operator command; don't use it to hand secrets to untrusted processes.
 - This is a tool-boundary guard, not a sandbox. Anyone who can run this script or read the wallet can still reach the secrets. For untrusted automation, run in a container and don't mount `~/.local/share/kwalletd`.
-
-## Differences from the pi extension
-
-This repo also ships a pi extension (`extension/`) that exposes the same concept to the pi coding agent as `kwallet_api` / `kwallet_list` / `kwallet_run` tools plus `/kwallet-*` commands, and blocks the agent's `bash` from calling `kwallet-query` directly. This CLI is the standalone, non-agent surface for the same workflow. The extension's `kwallet_run` mirrors the CLI `run` command with two agent-safety additions: the literal secret is scrubbed (`[REDACTED]`) from any output returned to the agent, and commands that access the wallet itself are refused — the run executes server-side, outside the bash tool, so it enforces its own copy of the block.

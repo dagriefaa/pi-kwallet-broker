@@ -1,0 +1,28 @@
+{
+  "name": "pi-kwallet-broker",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Use KWallet credentials from Pi without exposing values: kwallet_api / kwallet_list / kwallet_run tools plus a standalone kwallet-broker CLI.",
+  "keywords": [
+    "pi-package"
+  ],
+  "bin": {
+    "kwallet-broker": "./kwallet-broker"
+  },
+  "files": [
+    "extension",
+    "kwallet-broker",
+    "README.md",
+    "package.json"
+  ],
+  "pi": {
+    "extensions": [
+      "./extension/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
