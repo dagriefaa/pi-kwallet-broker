@@ -87,4 +87,4 @@ Override the wallet per-invocation: `KWALLET_NAME=other-wallet kwallet-broker li
 
 ## Differences from the pi extension
 
-This repo also ships a pi extension (`~/.pi/agent/extensions/kwallet-broker/`) that exposes the same concept to the pi coding agent as `kwallet_api` / `kwallet_list` tools plus `/kwallet-*` commands, and blocks the agent's `bash` from calling `kwallet-query` directly. This CLI is the standalone, non-agent surface for the same workflow.
+This repo also ships a pi extension (`extension/`) that exposes the same concept to the pi coding agent as `kwallet_api` / `kwallet_list` / `kwallet_run` tools plus `/kwallet-*` commands, and blocks the agent's `bash` from calling `kwallet-query` directly. This CLI is the standalone, non-agent surface for the same workflow. The extension's `kwallet_run` mirrors the CLI `run` command with two agent-safety additions: the literal secret is scrubbed (`[REDACTED]`) from any output returned to the agent, and commands that access the wallet itself are refused — the run executes server-side, outside the bash tool, so it enforces its own copy of the block.

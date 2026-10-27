@@ -8,6 +8,9 @@
  * Tools:
  *   - kwallet_api  : make an HTTPS request authenticated by a KWallet entry
  *   - kwallet_list : list KWallet entry names (names only, never values)
+ *   - kwallet_run  : run a bash command with a KWallet secret interpolated
+ *                    (secret exported as $KWALLET_SECRET for the command;
+ *                    never on argv; output scrubbed of the secret value)
  *
  * Commands (user-facing, run in extension context — typed values never enter
  * the agent conversation):
@@ -21,6 +24,13 @@
  *   - tool_call hook rewrites any bash command that references kwallet-query,
  *     secret-tool, kwalletcli, or the kwalletd data dir into a no-op, so the
  *     agent cannot exfiltrate secrets via the shell.
+ *   - kwallet_run refuses to execute commands matching the same pattern (the
+ *     run happens server-side, outside the bash tool, so it must enforce its
+ *     own copy of the block) and redacts the literal secret from any output
+ *     it returns, so the agent can USE the secret but never SEE it. Note this
+ *     is not cryptographic: an encoded secret (base64, hex, ...) or an outbound
+ *     network request could still carry the value out, exactly as with
+ *     kwallet_api. It is a tool-boundary guard, not a sandbox.
  *
  * Folder handling:
  *   - Credentials live in folder "pi-agent" of wallet "kdewallet" by default.
@@ -62,6 +72,12 @@ const WALLET = process.env.KWALLET_NAME ?? "kdewallet";
 const FOLDER = process.env.KWALLET_FOLDER ?? "pi-agent";
 const MAX_BODY = parseInt(process.env.KWALLET_MAX_BODY ?? "5242880", 10);
 const APPID = "pi"; // label shown in KWallet permission prompts / entry owner
+
+// Commands the agent must never run against the wallet itself. Applied BOTH to
+// the agent's bash tool (tool_call hook) and to kwallet_run's command (which
+// executes server-side and would otherwise bypass that hook).
+const BLOCK_RE =
+  /\b(kwallet-query|kwalletcli|secret-tool)\b|\.local\/share\/kwalletd|kwalletd5?\b/i;
 
 // KWallet6 uses org.kde.kwalletd6 @ /modules/kwalletd6; KWallet5 uses d5.
 const KWALLET_SERVICES = ["org.kde.kwalletd6", "org.kde.kwalletd5"] as const;
@@ -352,6 +368,106 @@ function doRequest(opts: HttpOpts, secret: string): Promise<{ status: number; he
 }
 
 // ---------------------------------------------------------------------------
+// Run helper (bash command with a KWallet secret in its environment)
+// ---------------------------------------------------------------------------
+
+const RUN_MAX_OUTPUT = MAX_BODY; // per-stream output cap returned to the agent
+const RUN_MAX_TIMEOUT_MS = 120_000;
+
+interface RunResult {
+  code: number | null;
+  signal: string | null;
+  timedOut: boolean;
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+}
+
+/**
+ * Run `bash -c <command>` with the secret exported as an environment variable.
+ * The secret travels via the child's environment (spawn env option), never
+ * argv, so it cannot appear in `ps`. The command string itself only ever
+ * contains the placeholder ($KWALLET_SECRET or the --envName name), which bash
+ * expands internally. Returns the result plus a `redact` function the caller
+ * MUST apply to any output before returning it to the agent.
+ */
+async function runWithSecret(
+  entry: string,
+  command: string,
+  envName: string,
+  timeoutMs: number,
+): Promise<{ result: RunResult; redact: (s: string) => string }> {
+  if (!command.trim()) {
+    throw new Error("command is required");
+  }
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName)) {
+    throw new Error(`envName '${envName}' is not a valid shell variable name`);
+  }
+  // Same block as the bash tool_call hook: the run executes server-side, so
+  // without this the agent could read ANY wallet folder via kwallet-query and
+  // defeat the extension's whole purpose.
+  if (BLOCK_RE.test(command)) {
+    throw new Error(
+      "blocked by kwallet-broker: command may not access the wallet directly; " +
+        "credentials may only be used via the interpolated env var",
+    );
+  }
+  const secret = await readSecret(entry);
+  if (!secret) {
+    throw new Error(`KWallet entry '${entry}' (folder '${FOLDER}') is empty — nothing to interpolate`);
+  }
+  // Literal (non-regex) split/join so secret contents can't break the scrub.
+  const redact = (s: string): string => s.split(secret).join("[REDACTED]");
+
+  const result = await new Promise<RunResult>((resolve, reject) => {
+    const child = spawn("bash", ["-c", command], {
+      env: { ...process.env, [envName]: secret },
+    });
+    const state = { timedOut: false, truncated: false };
+    let out: Buffer = Buffer.alloc(0);
+    let err: Buffer = Buffer.alloc(0);
+    const collect = (buf: Buffer, chunk: Buffer): Buffer => {
+      if (buf.length >= RUN_MAX_OUTPUT) {
+        state.truncated = true;
+        return buf;
+      }
+      const room = RUN_MAX_OUTPUT - buf.length;
+      if (chunk.length > room) {
+        state.truncated = true;
+        return Buffer.concat([buf, chunk.slice(0, room)]);
+      }
+      return Buffer.concat([buf, chunk]);
+    };
+    child.stdout.on("data", (c: Buffer) => {
+      out = collect(out, c);
+    });
+    child.stderr.on("data", (c: Buffer) => {
+      err = collect(err, c);
+    });
+    const timer = setTimeout(() => {
+      state.timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      resolve({
+        code,
+        signal,
+        timedOut: state.timedOut,
+        stdout: out.toString("utf8"),
+        stderr: err.toString("utf8"),
+        truncated: state.truncated,
+      });
+    });
+  });
+  return { result, redact };
+}
+
+// ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
@@ -451,6 +567,69 @@ export function register(pi: ExtensionAPI) {
     },
   });
 
+  // --- kwallet_run -------------------------------------------------------
+  pi.registerTool({
+    name: "kwallet_run",
+    label: "Run command with KWallet secret",
+    description:
+      "Run a bash command with a KWallet secret interpolated into it, for " +
+      "commands kwallet_api cannot express (CLIs, docker login, etc). The " +
+      "command string is executed by bash with the secret exported as an " +
+      "environment variable, so reference the secret as '$KWALLET_SECRET' (or " +
+      "the name given in envName) — bash expands it at run time. The secret is " +
+      "never on any process's command line, and it is scrubbed from the output " +
+      "before anything is returned. Returns the exit code plus stdout/stderr. " +
+      "Commands that access the wallet directly (kwallet-query etc.) are blocked.",
+    parameters: Type.Object({
+      credEntry: Type.String({ description: "KWallet entry name holding the secret (in the configured folder)." }),
+      command: Type.String({
+        description:
+          "Bash command string; reference the secret as $KWALLET_SECRET. " +
+          "Example: 'docker login -u alice -p \"$KWALLET_SECRET\" registry.example.com'. " +
+          "Do NOT try to read the wallet itself — such commands are blocked.",
+      }),
+      envName: Type.Optional(Type.String({ description: "Environment variable name holding the secret. Default KWALLET_SECRET." })),
+      timeoutMs: Type.Optional(Type.Number({ description: "Timeout in ms, capped at 120000. Default 30000." })),
+    }),
+    async execute(_toolCallId, p) {
+      try {
+        const timeoutMs = Math.min(Math.max(p.timeoutMs ?? 30_000, 1), RUN_MAX_TIMEOUT_MS);
+        const { result, redact } = await runWithSecret(
+          p.credEntry,
+          p.command,
+          p.envName ?? "KWALLET_SECRET",
+          timeoutMs,
+        );
+        const parts: string[] = [
+          `exit code: ${result.code ?? "none"}` +
+            (result.signal ? ` (signal ${result.signal})` : "") +
+            (result.timedOut ? ` [timed out after ${timeoutMs}ms]` : ""),
+        ];
+        if (result.stdout) parts.push("--- stdout ---", redact(result.stdout));
+        if (result.stderr) parts.push("--- stderr ---", redact(result.stderr));
+        if (result.truncated) {
+          parts.push(`[output truncated at ${RUN_MAX_OUTPUT} bytes per stream]`);
+        }
+        return {
+          content: [{ type: "text", text: parts.join("\n") }],
+          details: {
+            code: result.code,
+            signal: result.signal,
+            timedOut: result.timedOut,
+            truncated: result.truncated,
+          },
+        };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return {
+          content: [{ type: "text", text: `kwallet_run error: ${msg}` }],
+          isError: true,
+          details: { code: null, signal: null, timedOut: false, truncated: false },
+        };
+      }
+    },
+  });
+
   // ---------------------------------------------------------------------------
   // Commands (user-side; typed/pasted values never reach the agent)
   // ---------------------------------------------------------------------------
@@ -541,16 +720,15 @@ export function register(pi: ExtensionAPI) {
   // Defense-in-depth: block the agent from reading the wallet via bash
   // ---------------------------------------------------------------------------
 
-  const BLOCK_RE =
-    /\b(kwallet-query|kwalletcli|secret-tool)\b|\.local\/share\/kwalletd|kwalletd5?\b/i;
+  const BLOCK_MESSAGE =
+    "blocked by kwallet-broker: credentials may only be used via the kwallet_api / kwallet_run / kwallet_list tools";
 
   pi.on("tool_call", async (event) => {
     if (!isToolCallEventType("bash", event)) return;
     const cmd = event.input?.command ?? "";
     if (BLOCK_RE.test(cmd)) {
       // Rewrite to a no-op so the agent's attempt fails loudly without exfil.
-      event.input.command =
-        "echo 'blocked by kwallet-broker: credentials may only be used via the kwallet_api / kwallet_list tools'";
+      event.input.command = `echo '${BLOCK_MESSAGE}'`;
     }
   });
 }
