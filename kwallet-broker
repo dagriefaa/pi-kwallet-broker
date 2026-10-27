@@ -237,6 +237,72 @@ EOF
   exit $rc
 }
 
+cmd_run() {
+  local entry="" env_name="KWALLET_SECRET"
+  local -a cmd_words=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --entry) entry="$2"; shift 2 ;;
+      --env) env_name="$2"; shift 2 ;;
+      --folder) die "run: --folder is not supported; folder is locked to '$FOLDER'" ;;
+      -h|--help) cat <<EOF
+usage: $PROG run --entry <name> [--env NAME] -- <command>
+Run a bash command with a KWallet secret from the LOCKED '$FOLDER' folder
+interpolated into it. The command string is executed by 'bash -c' INSIDE this
+tool with the secret exported as an environment variable, so a placeholder
+like "\$KWALLET_SECRET" in the command expands to the secret. The secret never
+appears on any process's command line, in 'ps', or in shell history.
+
+required:
+  --entry <name>        KWallet entry holding the secret (in folder '$FOLDER')
+  -- <command>          bash command string referencing the secret as
+                        "\$KWALLET_SECRET" (or the name given by --env).
+                        Single-quote the whole command so YOUR shell does not
+                        expand the placeholder before this tool sees it.
+
+options:
+  --env <NAME>          environment variable name holding the secret
+                        (default KWALLET_SECRET)
+  -h, --help            show this help
+
+env:
+  KWALLET_NAME         wallet name  (default kdewallet)
+  (folder is fixed to '$FOLDER' and cannot be changed)
+
+examples:
+  $PROG run --entry gh -- 'curl -sS -H "Authorization: Bearer \$KWALLET_SECRET" https://api.github.com/user'
+  $PROG run --entry registry --env TOKEN -- 'docker login -u alice -p "\$TOKEN" registry.example.com'
+
+note: the command runs with full access to the secret (its environment
+contains it; so does anything it spawns). Like 'get', this is an operator
+command — don't hand its output or environment to untrusted processes.
+EOF
+        return 0 ;;
+      --) shift; cmd_words+=("$@"); break ;;
+      *) cmd_words+=("$1"); shift ;;
+    esac
+  done
+  [ -n "$entry" ] || die "run: --entry is required (see: $PROG run --help)"
+  [ "${#cmd_words[@]}" -gt 0 ] || die "run: a command is required after the options (see: $PROG run --help)"
+  [[ "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "run: --env must be a valid shell variable name, got '$env_name'"
+  need kwallet-query; need bash
+
+  local secret
+  secret="$(read_secret "$entry")" || die "run: failed to read KWallet entry '$entry' (folder '$FOLDER', wallet '$WALLET')"
+  [ -n "$secret" ] || die "run: entry '$entry' in folder '$FOLDER' is empty — nothing to interpolate (see: $PROG set)"
+
+  local cmd_str rc=0
+  cmd_str="${cmd_words[*]}"
+  # Subshell: the export only pollutes the child's environment, never this
+  # script's. bash -c's argv holds the placeholder command, not the secret;
+  # bash expands \$KWALLET_SECRET internally when building the real argv.
+  (
+    export "$env_name=$secret"
+    bash -c "$cmd_str"
+  ) || rc=$?
+  exit "$rc"
+}
+
 cmd_list() {
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -417,6 +483,8 @@ usage: $PROG <command> [options]
 
 commands:
   api             make an HTTPS/HTTP call authenticated by a KWallet entry
+  run             run a bash command with a KWallet secret interpolated
+                 (secret exported as \$KWALLET_SECRET, never on argv)
   list            list KWallet entry NAMES in "$FOLDER" (never values)
   set             store a secret in "$FOLDER" (reads value from stdin via --stdin)
   get             print a secret from "$FOLDER" to stdout (operator only)
@@ -445,12 +513,13 @@ main() {
   case "$1" in
     -h|--help|help) cmd_help; exit 0 ;;
     api)            shift; cmd_api "$@" ;;
+    run)            shift; cmd_run "$@" ;;
     list)           shift; cmd_list "$@" ;;
     set)            shift; cmd_set "$@" ;;
     get)            shift; cmd_get "$@" ;;
     delete)         shift; cmd_delete "$@" ;;
     ensure-folder)  shift; cmd_ensure_folder "$@" ;;
-    version|--version) printf '%s\n' "$PROG 1.1.0"; exit 0 ;;
+    version|--version) printf '%s\n' "$PROG 1.2.0"; exit 0 ;;
     *) die "unknown command '$1' (see: $PROG --help)" ;;
   esac
 }

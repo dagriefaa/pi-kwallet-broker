@@ -30,6 +30,9 @@ printf '%s' "$API_KEY" | kwallet-broker set agent-openai --stdin
 # 3. use it — secret is attached by the tool, never printed
 kwallet-broker api --entry agent-openai --url https://api.openai.com/v1/models
 
+# 3b. or run any bash command with the secret interpolated as an env var
+kwallet-broker run --entry gh -- 'curl -sS -H "Authorization: Bearer $KWALLET_SECRET" https://api.github.com/user'
+
 # 4. list entry names (names only, never values)
 kwallet-broker list
 ```
@@ -44,6 +47,7 @@ Run `kwallet-broker --help` or `kwallet-broker <command> --help`.
 | command | description |
 |---|---|
 | `api` | HTTPS/HTTP call authenticated by a KWallet entry |
+| `run` | run a bash command with the secret interpolated — exported as `$KWALLET_SECRET` (or `--env NAME`) for an inner `bash -c`, never on argv |
 | `list` | list KWallet entry **names** in a folder (never values) |
 | `set` | store a secret in `pi-agent` (reads value from stdin via `--stdin`); two-step create-empty-then-overwrite so the value never hits the cmdline |
 | `get` | print a secret to stdout (**operator only**) |
@@ -78,6 +82,7 @@ Override the wallet per-invocation: `KWALLET_NAME=other-wallet kwallet-broker li
 - `set`'s value is read via stdin; `--stdin` is required and the tool refuses to read from a TTY prompt so it can't hang or echo the value.
 - `ensure-folder` creates the `pi-agent` folder via `qdbus createFolder` and then `close()`s the wallet handle to flush to disk (without the flush, KWallet6 keeps the folder in-memory only and it vanishes on the next open).
 - `get` prints the secret to stdout — **operator only**. Don't pipe it into an AI agent.
+- `run` executes the command via `bash -c` in a subshell with the secret exported as an environment variable (`KWALLET_SECRET` by default, or `--env NAME`). The secret never appears on any process's argv — `bash -c`'s argv contains only the placeholder command, and bash expands the variable internally. The command string should be single-quoted so your own shell doesn't expand the placeholder. The child process's *environment* does contain the secret (same-user/root readable via `/proc`), as does anything the command spawns — like `get`, this is an operator command; don't use it to hand secrets to untrusted processes.
 - This is a tool-boundary guard, not a sandbox. Anyone who can run this script or read the wallet can still reach the secrets. For untrusted automation, run in a container and don't mount `~/.local/share/kwalletd`.
 
 ## Differences from the pi extension
